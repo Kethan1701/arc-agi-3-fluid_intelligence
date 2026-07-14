@@ -11,11 +11,20 @@
 #   (c) Test real inference directly in a Kaggle notebook, which runs
 #       Linux + NVIDIA GPUs natively.
 #
-# Kaggle's execution image already provides recent torch/CUDA; you should
-# NOT pip-install a fresh torch/vllm inside the submission notebook if the
-# competition disallows internet access during scoring — only install
-# what you need at BUILD time or pin versions matching the base image.
-
+# CORRECTED NOTE (verified against the official ARC-AGI-3-Kaggle-Starter
+# repo, which does not install or require torch/vllm at all -- the
+# baseline "Stochastic Goose" sample is pure random action selection):
+# Kaggle's accelerated notebook sessions have internet FULLY disabled and
+# there is no documented guarantee of a preinstalled vLLM build with
+# Blackwell (sm_120 / RTX 6000 Pro) kernels. Do not assume it's there --
+# probe for it (`import vllm; vllm.__version__`) in a scratch Kaggle
+# notebook cell first. If it's missing or too old, you must bundle your
+# own wheels as a private Kaggle Dataset and install them offline in your
+# submission notebook, exactly the way the starter kit already installs
+# the `arc-agi` package itself:
+#   !pip install --no-index --find-links /kaggle/input/<your-wheels-dataset>/ \
+#       vllm torch
+#
 # --- core (works on Windows/macOS/Linux, no GPU required) --------------
 numpy>=1.26,<2.0
 pyyaml>=6.0
@@ -25,8 +34,17 @@ pytest>=8.0
 
 # --- gpu / real inference (Linux + NVIDIA only — WSL2 or Kaggle) -------
 # Uncomment on a Linux box with an NVIDIA GPU + matching CUDA toolkit.
-# torch>=2.3
-# vllm>=0.5
+# Versions below are pinned for Blackwell (RTX 6000 Pro, "sm_120") support
+# specifically -- verify against current vLLM release notes before
+# submitting, this is a fast-moving compatibility surface:
+#   * vllm>=0.13.0 is the first release with native SM120 CUTLASS/NVFP4
+#     MoE kernels (github.com/vllm-project/vllm issue #31085).
+#   * Needs a CUDA-13 torch build; flashinfer JIT is currently broken on
+#     sm_120 with CUDA-13 PyPI wheels -- agent/model_runtime.py forces
+#     VLLM_ATTENTION_BACKEND=FLASH_ATTN automatically when it detects a
+#     Blackwell device (see detect_gpu_arch()).
+# torch>=2.6           # must be a CUDA-13-enabled build for sm_120
+# vllm>=0.13.0
 # transformers>=4.42
 # accelerate>=0.31
 

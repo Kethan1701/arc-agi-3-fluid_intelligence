@@ -48,6 +48,36 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 
 
+def detect_gpu_arch() -> tuple[str, tuple[int, int] | None]:
+    """
+    Identify the GPU compute capability so `VLLMPolicy` can apply
+    architecture-specific workarounds. Returns (label, capability_tuple);
+    capability is None if no CUDA device is visible (e.g. local CPU dev).
+
+    Blackwell workstation/consumer parts (RTX 6000 Pro, RTX 50-series)
+    report compute capability 12.0 ("sm_120"). Datacenter Blackwell
+    (B100/B200/GB200) reports 10.x. Both are recent enough (as of vLLM
+    0.13+) to need the flashinfer workaround below -- see
+    `VLLMPolicy.__init__`.
+    """
+    try:
+        import torch  # noqa: PLC0415
+    except ImportError:
+        return "no-torch", None
+    if not torch.cuda.is_available():
+        return "no-cuda-device", None
+    major, minor = torch.cuda.get_device_capability(0)
+    if major == 12:
+        return "blackwell-workstation", (major, minor)
+    if major == 10:
+        return "blackwell-datacenter", (major, minor)
+    if major == 9:
+        return "hopper", (major, minor)
+    if major == 8:
+        return "ampere", (major, minor)
+    return f"sm_{major}{minor}", (major, minor)
+
+
 @dataclass
 class PolicyOutput:
     action: str
@@ -72,6 +102,36 @@ class VLLMPolicy:
     tokenizer files, safetensors weights, etc.) -- i.e. exactly what you'd
     get from `snapshot_download(..., local_dir=...)` while you still have
     internet, then upload as a private Kaggle dataset.
+
+    Blackwell (RTX 6000 Pro / "sm_120") notes:
+        * Native SM120 CUTLASS/NVFP4 kernels landed in vLLM 0.13.0 --
+          pin `vllm>=0.13.0` (and a matching CUDA-13 torch build) when
+          bundling wheels for this GPU. Older vLLM builds either fail to
+          import on sm_120 or silently fall back to slow paths.
+        * As of the vLLM versions available at the time this was written,
+          flashinfer's JIT compilation is broken on sm_120 when paired
+          with the CUDA-13 PyPI wheels (triggered by
+          `--attention-backend flashinfer` or `--kv-cache-dtype
+          fp8_e5m2`). We defensively force `VLLM_ATTENTION_BACKEND=
+          FLASH_ATTN` whenever `detect_gpu_arch()` reports a Blackwell
+          part, unless the caller already set the env var explicitly.
+          Re-check this against current vLLM release notes before
+          submitting -- this is exactly the kind of fast-moving
+          hardware-support detail that goes stale quickly.
+        * The RTX 6000 Pro's 96GB of VRAM gives a lot of headroom versus
+          typical Kaggle GPUs (T4=16GB, P100=16GB) -- `gpu_memory_utilization`
+          can stay conservative (0.85 default here) since Kaggle notebooks
+          also run non-GPU process overhead alongside vLLM, but you have
+          plenty of room to raise `max_model_len` or batch size vs. what
+          you'd use on a T4.
+        * vLLM/torch are NOT preinstalled or required by the official
+          ARC-AGI-3 Kaggle starter kit, and the accelerated Kaggle session
+          has no internet access -- you must bundle matching vLLM/torch
+          wheels (built for CUDA 13 / sm_120) as a private Kaggle Dataset
+          and `pip install --no-index --find-links /kaggle/input/<wheels-
+          dataset>/ vllm torch ...` in your submission notebook, the same
+          offline-wheel pattern the starter kit already uses for the
+          `arc-agi` package itself.
     """
 
     def __init__(
@@ -91,12 +151,29 @@ class VLLMPolicy:
                 "time)."
             )
 
+        arch_label, capability = detect_gpu_arch()
+        is_blackwell = arch_label in ("blackwell-workstation", "blackwell-datacenter")
+        if is_blackwell and "VLLM_ATTENTION_BACKEND" not in os.environ:
+            # See the Blackwell notes in this class's docstring: flashinfer
+            # JIT is currently broken on sm_120 with CUDA-13 PyPI wheels.
+            # Force the known-good backend rather than letting vLLM
+            # auto-select and fail deep into a 9-hour run.
+            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+
         # Lazy import: keeps this module importable on machines without
         # vLLM installed (e.g. plain Windows dev boxes).
         from vllm import LLM, SamplingParams  # noqa: PLC0415
 
+        import logging  # noqa: PLC0415
+
+        logging.getLogger("arc_agent").info(
+            "VLLMPolicy: detected GPU arch=%s capability=%s attention_backend=%s",
+            arch_label, capability, os.environ.get("VLLM_ATTENTION_BACKEND", "<vllm default>"),
+        )
+
         self.model_dir = model_dir
         self.max_new_tokens = max_new_tokens
+        self.gpu_arch = arch_label
 
         self._llm = LLM(
             model=model_dir,
