@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -132,6 +133,19 @@ class VLLMPolicy:
           dataset>/ vllm torch ...` in your submission notebook, the same
           offline-wheel pattern the starter kit already uses for the
           `arc-agi` package itself.
+
+    Concurrency note (verified against `agents/swarm.py` in the official
+    ARC-AGI-3-Agents framework): the real harness runs every game's agent
+    concurrently in its own thread, sharing one process -- so `act()` can
+    be called from many threads at once against this single instance.
+    vLLM's synchronous `LLM.generate()` is not designed for unsynchronized
+    concurrent calls, so `act()` serializes access with a lock. This is a
+    correctness choice, not a throughput-optimal one: calls queue up
+    behind each other rather than being batched together. If profiling
+    shows this is a bottleneck, the real fix is to move to vLLM's
+    `AsyncLLMEngine` (or an OpenAI-compatible server you run alongside
+    the notebook) so concurrent requests get batched by vLLM itself
+    instead of serialized here.
     """
 
     def __init__(
@@ -174,6 +188,7 @@ class VLLMPolicy:
         self.model_dir = model_dir
         self.max_new_tokens = max_new_tokens
         self.gpu_arch = arch_label
+        self._lock = threading.Lock()
 
         self._llm = LLM(
             model=model_dir,
@@ -193,7 +208,11 @@ class VLLMPolicy:
 
     def act(self, prompt: str, action_space: list[str]) -> PolicyOutput:
         full_prompt = self._build_prompt(prompt, action_space)
-        outputs = self._llm.generate([full_prompt], self._sampling_params)
+        # Serialize concurrent callers -- see the concurrency note in this
+        # class's docstring. Games run in separate threads and may all
+        # call act() around the same time.
+        with self._lock:
+            outputs = self._llm.generate([full_prompt], self._sampling_params)
         raw_text = outputs[0].outputs[0].text.strip()
         return self._parse(raw_text, action_space)
 

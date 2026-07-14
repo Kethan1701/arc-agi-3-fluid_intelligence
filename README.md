@@ -1,149 +1,241 @@
 # arc-agi-3-fluid_intelligence
 
-Local development pipeline and baseline agent for the Kaggle **ARC Prize
-2026 — ARC-AGI-3** competition (interactive reasoning benchmark: agents
-explore dynamic game environments, build a world model, and act
-step-by-step, rather than transforming a static input grid).
+`hybrid_lib`: a reusable, testable decision core (episodic memory +
+deterministic fallback solver + confidence-gated LLM routing + resource
+budget management) for a Kaggle **ARC Prize 2026 — ARC-AGI-3** agent,
+plus a reference `agent/my_agent.py` that wires it into the real
+competition harness contract.
 
-## Directory structure
+ARC-AGI-3 is an interactive reasoning benchmark: agents explore dynamic
+game environments, build a world model, and act step-by-step, rather
+than transforming a static input grid like prior ARC competitions.
+
+Everything here — the harness interface, `arcengine` types, the
+Blackwell/RTX 6000 Pro GPU notes, the concurrency model — was verified
+by cloning and reading the official `arcprize/ARC-AGI-3-Kaggle-Starter`
+and `arcprize/ARC-AGI-3-Agents` repos directly, not guessed at.
+
+## Two-repo workflow
+
+This is important and not how the first draft of this project was
+structured, so it's worth being explicit about: **your actual Kaggle
+submission is built from a separate clone of the official starter kit,
+not from this repo directly.**
+
+Why: the official `scripts/build_notebook.py` (in
+`arcprize/ARC-AGI-3-Kaggle-Starter`) builds your submission notebook by
+splicing the **raw text of one file**, `agent/my_agent.py`, into a
+notebook cell. It does not copy any sibling files. So this repo's
+`hybrid_lib/` package — the actual engineering (memory, fallback solver,
+resource management, offline vLLM wrapper) — has to reach Kaggle a
+different way: as a wheel, installed offline in the notebook, exactly
+the way the starter kit already installs the `arc-agi` package itself.
+
+The split:
+
+| This repo (`arc-agi-3-fluid_intelligence`)          | Your official starter clone                          |
+|------------------------------------------------------|--------------------------------------------------------|
+| `hybrid_lib/` — the reusable decision core, unit tested | `agent/my_agent.py` — the one file Kaggle reads, copied in from here |
+| `agent/my_agent.py` — reference implementation to copy over | `make setup / play-local / submit / status` — the real local-dev and submission workflow |
+| `scripts/bundle_for_kaggle.py` — builds the `hybrid_lib` wheel | vendors `ARC-AGI-3-Agents` (MIT) and the live gateway connection for real local play |
+
+We deliberately do **not** vendor the starter kit's Makefile/scripts
+into this repo: as of this writing it has no LICENSE file (unlike
+`ARC-AGI-3-Agents`, which is MIT), so we point you at cloning it
+yourself rather than redistributing a copy here.
+
+### Setting it up
+
+```powershell
+# 1. This repo: the hybrid_lib library + its tests.
+cd path\to\arc-agi-3-fluid_intelligence
+uv venv
+uv pip install -e . -r requirements.txt --python .venv\Scripts\python.exe
+
+# 2. A sibling clone of the official starter kit (needs its own
+#    Python 3.12 + make; see its README for full setup, incl. an
+#    ARC Prize API key for local play and a Kaggle API token for submit).
+cd ..
+git clone https://github.com/arcprize/ARC-AGI-3-Kaggle-Starter.git
+cd ARC-AGI-3-Kaggle-Starter
+make setup
+
+# 3. Copy the reference agent over, then point it at hybrid_lib:
+cp ../arc-agi-3-fluid_intelligence/agent/my_agent.py agent/my_agent.py
+.venv/bin/pip install -e ../arc-agi-3-fluid_intelligence   # editable, for local play-local
+
+make play-local          # drives MyAgent against real games over the network
+```
+
+`make play-local` in the starter kit connects over HTTP to the live ARC
+Prize game server (needs an API key and internet **on your dev
+machine** — this is separate from, and does not violate, the
+no-internet constraint that only applies to the actual Kaggle scoring
+environment).
+
+## Directory structure (this repo)
 
 ```
 arc-agi-3-fluid_intelligence/
+├── hybrid_lib/                  # installable package -- ships to Kaggle as a wheel
+│   ├── decision_core.py         # HybridDecisionCore: shared, thread-safe routing brain
+│   ├── model_runtime.py         # VLLMPolicy (offline vLLM, Blackwell-aware) + StubPolicy
+│   ├── state.py                 # GameMemory (per-game) / SessionMemory (per-run)
+│   ├── fallback_solver.py       # deterministic heuristic/exploration solver
+│   └── resource_manager.py      # 9h wall-clock budget, thread-safe
 ├── agent/
-│   ├── my_agent.py         # ArcAgent: main decision loop + hybrid routing
-│   ├── model_runtime.py    # VLLMPolicy (offline vLLM) + StubPolicy (no-GPU dev)
-│   ├── state.py             # GameMemory (per-game) / SessionMemory (per-run)
-│   ├── fallback_solver.py  # deterministic heuristic/exploration solver
-│   └── resource_manager.py # 9h wall-clock budget + VRAM cleanup
-├── env/
-│   ├── env_adapter.py      # ArcEnv protocol + Kaggle harness shim (EDIT before submitting)
-│   └── local_mock_env.py   # offline toy env for local dev/testing
-├── configs/
-│   └── default.yaml        # thresholds, model settings, resource budget
-├── scripts/
-│   ├── run_local.py        # play N episodes locally, print summary
-│   └── bundle_for_kaggle.py# package agent/env/configs into a submission zip
+│   └── my_agent.py              # MyAgent(Agent) reference impl -- copy into your starter clone
 ├── tests/
-│   └── test_agent_smoke.py # offline end-to-end smoke tests (pytest)
-├── models/                 # local model weight dirs go here (gitignored)
+│   └── test_hybrid_lib.py       # offline tests against REAL arcengine types
+├── models/                      # local model weight dirs go here (gitignored)
+├── pyproject.toml               # hybrid_lib packaging (hatchling)
 ├── requirements.txt
 └── .gitignore
 ```
 
-## Setup (local, Windows-friendly)
-
-This machine already has `uv` on PATH, so:
-
-```powershell
-cd path\to\arc-agi-3-fluid_intelligence
-uv venv
-.venv\Scripts\activate
-uv pip install -r requirements.txt
-```
-
-(Plain `python -m venv .venv && pip install -r requirements.txt` also
-works.) The default `requirements.txt` only installs CPU-only, GPU-free
-packages — `torch`/`vllm` are commented out because **vLLM does not
-install natively on Windows**. The full agent loop (state tracking,
-fallback routing, resource management) is fully testable without them via
-`agent.model_runtime.StubPolicy`, which is the default in
-`configs/default.yaml` (`use_vllm: false`).
-
-## Running the local smoke loop
-
-```powershell
-python scripts\run_local.py --episodes 10
-```
-
-This plays the agent (StubPolicy, i.e. always routes to the deterministic
-fallback solver) against `LocalMockEnv` and prints a solve-rate + resource
-summary. Use `--verbose` for per-step logs.
-
 ## Running tests
 
 ```powershell
-pytest tests/
+.venv\Scripts\python.exe -m pytest tests/ -v
 ```
 
-## Testing real inference (VLLMPolicy)
+Tests exercise `HybridDecisionCore` directly against real
+`arcengine.FrameData`/`GameAction`/`GameState` objects (the `arcengine`
+package is pip-installable standalone — pure Python + numpy + pydantic,
+no GPU needed, works on Windows). They deliberately do **not**
+instantiate `MyAgent` itself, since it subclasses `agents.agent.Agent`
+from the separate `ARC-AGI-3-Agents` framework, which only becomes
+importable once you've vendored that repo (step 2 above). One test
+(`test_concurrent_games_do_not_corrupt_shared_state`) plays several toy
+games on separate threads against one shared core, mirroring the real
+harness's concurrency model (see below).
 
-vLLM requires Linux + an NVIDIA GPU. Two options:
+## Concurrency model — read this before writing GPU code
 
-1. **WSL2**: install a Linux distro, install `torch`/`vllm` from the
-   commented block in `requirements.txt` there, download a small local
-   model, then run:
-   ```bash
-   python scripts/run_local.py --episodes 3 --use-vllm --model-dir ./models/your-model
-   ```
-2. **Kaggle notebook**: iterate directly in a GPU-enabled Kaggle notebook,
-   which matches the actual submission environment (RTX 6000, offline).
+Verified in `agents/swarm.py` (`ARC-AGI-3-Agents`): the real harness
+creates **one `MyAgent` instance per game** and runs all of them
+**concurrently, each in its own thread, in one process** — with up to
+~110 games in the full competition rerun, that's potentially ~110
+threads calling `choose_action` around the same time, all sharing
+whatever model you load.
 
-`model_dir` must be a **local directory** (already downloaded — see
-below). `VLLMPolicy` refuses to fall back to a hub download; internet is
-disabled at Kaggle inference time, so any hub call would just hang/fail
-there, and this scaffold is designed to fail loudly and immediately
-instead, in local dev, if the path doesn't exist.
+Consequences already handled in `hybrid_lib`:
+- `HybridDecisionCore` is a process-wide singleton
+  (`hybrid_lib.decision_core.get_shared_core`), so the model loads once,
+  not once per game.
+- `ResourceManager` tracks per-game timing in a dict keyed by `game_id`
+  (not a single shared attribute) and guards all mutation with a lock.
+- `VLLMPolicy.act()` serializes concurrent calls with a lock, since
+  vLLM's synchronous `LLM.generate()` isn't safe for unsynchronized
+  concurrent calls from multiple threads. This is a **correctness**
+  choice, not a throughput-optimal one — calls queue rather than being
+  batched. If this is a bottleneck in practice, the real fix is vLLM's
+  `AsyncLLMEngine` (or an OpenAI-compatible server alongside the
+  notebook) so vLLM does the batching instead of this lock serializing
+  everything.
+- There is deliberately **no per-game VRAM cleanup** —
+  `torch.cuda.empty_cache()` between games isn't safe when other games'
+  threads may have in-flight requests against the same model. VRAM
+  cleanup is a single `HybridDecisionCore.shutdown()` call, meant for
+  process exit only, after every game thread has finished.
+
+## Running real inference (VLLMPolicy) on RTX 6000 Pro (Blackwell)
+
+Yes, this works — `rtx6000` (Kaggle accelerator `nvidiaRtx6000`, a GCP
+`g4-standard-48` instance) is a real, first-class, ARC-AGI-3-exclusive
+accelerator option, set via `ACCELERATOR` in your starter clone's
+`scripts/build_notebook.py`. It burns GPU quota faster than T4/P100, so
+the starter kit's own comment says "use only when you're confident."
+
+Verified compatibility notes (re-check against current vLLM release
+notes before submitting — this is a fast-moving surface):
+- `vllm>=0.13.0` is the first release with native SM120 (Blackwell)
+  CUTLASS/NVFP4 kernels.
+- flashinfer's JIT compilation is currently broken on sm_120 with
+  CUDA-13 PyPI wheels. `hybrid_lib/model_runtime.py`'s
+  `detect_gpu_arch()` detects Blackwell and `VLLMPolicy` forces
+  `VLLM_ATTENTION_BACKEND=FLASH_ATTN` automatically as a defensive
+  workaround.
+- **Neither torch nor vLLM is preinstalled or required by the official
+  starter kit**, and Kaggle's accelerated sessions have zero internet
+  access. You must bundle matching CUDA-13 torch/vllm wheels as a
+  private Kaggle Dataset and install them offline in your submission
+  notebook, the same `pip install --no-index --find-links` pattern the
+  starter kit already uses for `arc-agi` itself. See the commented block
+  in `requirements.txt`.
+- The 96GB VRAM gives a lot of headroom vs. T4/P100 (16GB each) — plenty
+  of room to raise `max_model_len` or batch size once you've profiled a
+  baseline.
+
+Since vLLM doesn't install on native Windows, test the real
+`VLLMPolicy` path either in WSL2 or directly in a Kaggle notebook (both
+Linux + NVIDIA GPU). `StubPolicy` (the local default) exercises every
+other code path — memory, fallback routing, resource management,
+concurrency — without needing a GPU at all.
 
 ## Uploading model weights for Kaggle
 
-Kaggle Datasets, not the code submission zip, are the right place for
-model weights:
+Kaggle Datasets, not any code bundle, are the right place for model
+weights:
 
 1. While you still have internet, download your model to a local folder:
    ```python
    from huggingface_hub import snapshot_download
    snapshot_download("org/model-name", local_dir="models/your-model")
    ```
-2. Create a private Kaggle Dataset from that local folder (Kaggle web UI
-   or `kaggle datasets create`).
-3. Attach the dataset to your submission notebook — it mounts read-only
-   at `/kaggle/input/<dataset-slug>/...`.
-4. Point `AgentConfig.model_dir` (in `agent/my_agent.py::get_agent()`, or
-   `configs/default.yaml`) at that mounted path.
+2. Create a private Kaggle Dataset from that local folder.
+3. Attach it to your submission notebook — mounts read-only at
+   `/kaggle/input/<dataset-slug>/...`.
+4. Point `CONFIG.model_dir` in `agent/my_agent.py` at that mounted path,
+   and set `CONFIG.use_vllm = True`.
 
-## Packaging for submission
+## Packaging hybrid_lib for Kaggle
 
 ```powershell
 python scripts\bundle_for_kaggle.py
 ```
 
-Produces `kaggle_submission/arc_agi3_submission.zip` containing
-`agent/`, `env/`, `configs/`, and a `MANIFEST.json` (git commit, config
-used, timestamp). Model weights are **not** included — see above.
-
-## Before your first real submission — two manual steps
-
-This scaffold was built without internet access to the competition's
-private starter kit, so two things are deliberately left as
-placeholders rather than guessed at:
-
-1. **Confirm the harness calling convention.** Once you've accepted the
-   competition rules, download the official ARC-AGI-3 starter kit from
-   the Kaggle competition page. Check how it actually invokes your
-   submitted agent (module-level function? class with a specific
-   method?) and reconcile that against `env/env_adapter.py`'s
-   `KaggleHarnessEnv` shim and `agent/my_agent.py`'s `get_agent()`
-   entrypoint — both are clearly marked with `EDIT ME` / docstring notes.
-2. **Stage your model weights** as described above and update
-   `model_dir` accordingly.
+Runs `uv build`, producing `dist/hybrid_lib-*.whl`. Upload that as a
+private Kaggle Dataset (or a new version of an existing one), then add
+an offline install line for it in your starter clone's notebook install
+cell, alongside the `arc-agi` wheel install. Full steps are printed by
+the script.
 
 ## Design notes
 
-- **Hybrid routing** (`agent/my_agent.py::ArcAgent._decide`): resource
-  budget exhausted → fallback; detected action loop → fallback; primary
-  policy confidence below `confidence_threshold` → fallback; otherwise
-  use the primary policy. This order means a healthy, confident model is
-  always preferred, but the pipeline never blocks the full 9-hour budget
-  on a model that's stuck, slow, or unavailable.
+- **Hybrid routing** (`hybrid_lib/decision_core.py::HybridDecisionCore._decide`):
+  resource budget exhausted → fallback; detected action loop → fallback;
+  primary policy confidence below `confidence_threshold` → fallback;
+  otherwise use the primary policy. A healthy, confident model is always
+  preferred, but the pipeline never blocks the 9-hour budget on a model
+  that's stuck, slow, or unavailable.
 - **Confidence** is self-reported by the model in a structured JSON
   response (`{"action": ..., "confidence": ..., "reason": ...}`) rather
-  than derived from token log-probs — simpler to reason about and
-  model-agnostic, at the cost of trusting the model's self-assessment.
-  If you find the model is overconfident/underconfident in practice,
-  swap in a log-prob-based confidence estimator in `VLLMPolicy._parse`.
-- **`FallbackSolver`** is deliberately simple (optimistic
-  untried-action exploration, loop-breaking, effectiveness-weighted
-  exploration) rather than a hand-built ARC-DSL search, since game rules
-  are unknown a priori and vary per game. `_search_action_sequence` is
-  a documented, unimplemented extension point for deeper search once
-  you've characterized specific game families worth targeting.
+  than derived from token log-probs — simpler and model-agnostic, at the
+  cost of trusting the model's self-assessment. Swap in a log-prob-based
+  estimator in `VLLMPolicy._parse` if you find it under/overconfident.
+- **`FallbackSolver`** is deliberately simple (optimistic untried-action
+  exploration, loop-breaking, effectiveness-weighted exploration) rather
+  than a hand-built ARC-DSL search, since game rules are unknown a
+  priori and vary per game. `_search_action_sequence` is a documented,
+  unimplemented extension point for deeper search once you've
+  characterized specific game families (via real `make play-local` runs)
+  worth targeting.
+- **Frame shape**: `arcengine.FrameData.frame` is `list[list[list[int]]]`
+  — a frame is a *list of 2D grids*, not one grid. `hybrid_lib.state`
+  types this as `MultiGrid` and hashes/compares the whole thing.
+
+## Before your first real submission
+
+1. Clone the official starter kit (see "Two-repo workflow" above) and
+   run through its own README — it needs an ARC Prize API key (for
+   `make play-local`) and a Kaggle API token (for `make submit`).
+2. Build and upload the `hybrid_lib` wheel (above), and edit the install
+   cell in the starter's notebook build script to install it.
+3. Stage and upload your model weights as their own Kaggle Dataset, and
+   set `CONFIG.model_dir`/`CONFIG.use_vllm` in `agent/my_agent.py`.
+4. If you're targeting the RTX 6000 Pro accelerator, also bundle
+   matching CUDA-13 torch/vllm wheels (see above) — nothing GPU-related
+   is preinstalled.
+5. `make play-local` in your starter clone to sanity check against real
+   games before `make submit`.

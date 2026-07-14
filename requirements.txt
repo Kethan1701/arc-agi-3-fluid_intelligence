@@ -26,8 +26,16 @@
 #       vllm torch
 #
 # --- core (works on Windows/macOS/Linux, no GPU required) --------------
-numpy>=1.26,<2.0
-pyyaml>=6.0
+# arcengine is the real frame/action/state type package (pip name for
+# the types vendored inside `arc-agi`) -- installing it directly (rather
+# than the full `arc-agi` meta-package, which also pulls in flask,
+# matplotlib, pillow, etc. for its CLI/visualization tooling) keeps local
+# dev lightweight while giving tests the REAL FrameData/GameAction/
+# GameState classes instead of guessed stand-ins. Your actual Kaggle
+# submission still installs the full `arc-agi` wheel offline (that's
+# fixed by the official starter kit's notebook, not by this file).
+arcengine>=0.9.3
+numpy>=2.0            # arcengine/arc-agi require numpy>=2
 pydantic>=2.6
 rich>=13.7          # nice local console logging, optional
 pytest>=8.0

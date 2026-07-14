@@ -18,8 +18,9 @@ Design goals:
         2. Tiny program-synthesis-style search: for grids small enough,
            brute-force short action sequences (depth-limited DFS/BFS) and
            replay the one that most reduces "distance" to a heuristic
-           goal signal (e.g. score increase, or grid stops changing in a
-           way that matches a previously solved level's trajectory).
+           goal signal (e.g. levels_completed increasing, or grid stops
+           changing in a way that matches a previously solved level's
+           trajectory).
 
     This is intentionally simple -- a real ARC-AGI-3 fallback benefits far
     more from good exploration heuristics + safe defaults than from a
@@ -27,6 +28,11 @@ Design goals:
     differ per game. Extend `_search_action_sequence` with real ARC-DSL
     primitives (rotate/flood-fill/symmetry-detection, etc.) if you want to
     invest further here; the hooks are structured so that's a drop-in.
+
+This module has no dependency on `arcengine`/`GameAction` -- it operates
+purely on action-name strings and a `GameMemory`. `agent/my_agent.py` is
+responsible for translating `arcengine.GameAction`/`FrameData` to/from
+this module's plain types.
 """
 
 from __future__ import annotations
@@ -34,8 +40,15 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
-from agent.state import GameMemory
-from env.env_adapter import RawObservation
+from hybrid_lib.state import GameMemory
+
+# arcengine.ComplexAction's x/y both range over [0, 63] (a fixed 64x64
+# coordinate space) regardless of the actual game grid's size -- verified
+# against arcengine.enums.ComplexAction. Actions that need this kind of
+# (x, y) payload (e.g. ACTION6) are passed in via `complex_actions` below
+# rather than hardcoded here, since that set is defined by arcengine, not
+# by this module.
+COMPLEX_ACTION_COORD_MAX = 63
 
 
 @dataclass
@@ -51,17 +64,18 @@ class FallbackSolver:
 
     def decide(
         self,
-        observation: RawObservation,
+        action_space: list[str],
         memory: GameMemory,
+        complex_actions: frozenset[str] = frozenset(),
     ) -> FallbackDecision:
-        action_space = observation.action_space or ["NOOP"]
+        action_space = action_space or ["RESET"]
 
         # 1) Prioritize actions we have never tried -- pure information
         #    gain, cheap, and often reveals game mechanics fast.
         untried = memory.untried_actions(action_space)
         if untried:
             action = self._rng.choice(untried)
-            return FallbackDecision(action, None, reasoning="explore-untried-action")
+            return self._finalize(action, complex_actions, reasoning="explore-untried-action")
 
         # 2) If we're in a detected loop, force a jump to whatever action
         #    has the highest historical "changed the frame" rate, biased
@@ -75,9 +89,7 @@ class FallbackSolver:
             )
             for candidate in ranked:
                 if not last_action or candidate != last_action[0]:
-                    return FallbackDecision(
-                        candidate, None, reasoning="break-detected-loop"
-                    )
+                    return self._finalize(candidate, complex_actions, reasoning="break-detected-loop")
 
         # 3) Otherwise, softmax-ish weighted choice favoring actions that
         #    historically changed the frame (i.e. "did something").
@@ -85,7 +97,18 @@ class FallbackSolver:
         total = sum(weights)
         probs = [w / total for w in weights]
         action = self._rng.choices(action_space, weights=probs, k=1)[0]
-        return FallbackDecision(action, None, reasoning="weighted-exploration")
+        return self._finalize(action, complex_actions, reasoning="weighted-exploration")
+
+    def _finalize(
+        self, action: str, complex_actions: frozenset[str], reasoning: str
+    ) -> FallbackDecision:
+        action_args = None
+        if action in complex_actions:
+            action_args = {
+                "x": self._rng.randint(0, COMPLEX_ACTION_COORD_MAX),
+                "y": self._rng.randint(0, COMPLEX_ACTION_COORD_MAX),
+            }
+        return FallbackDecision(action, action_args, reasoning=reasoning)
 
     # ------------------------------------------------------------------
     # Optional deeper search hook (disabled by default -- see class
@@ -93,18 +116,18 @@ class FallbackSolver:
     # ------------------------------------------------------------------
     def _search_action_sequence(
         self,
-        observation: RawObservation,
+        action_space: list[str],
         memory: GameMemory,
         max_depth: int = 4,
     ) -> list[str] | None:
         """
         Placeholder for a depth-limited search over short action sequences.
         Not wired into `decide()` by default because, without a scoring
-        oracle for "closer to solved" beyond the game's own score signal,
-        blind lookahead search burns wall-clock budget with no guarantee
-        of being better than the reactive heuristics above. Implement this
-        once you've characterized a specific family of ARC-AGI-3 games
-        (e.g. via the local mock harness or replayed traces) where
+        oracle for "closer to solved" beyond the game's own level-complete
+        signal, blind lookahead search burns wall-clock budget with no
+        guarantee of being better than the reactive heuristics above.
+        Implement this once you've characterized a specific family of
+        ARC-AGI-3 games (via `make play-local` against real games) where
         multi-step lookahead demonstrably helps.
         """
         raise NotImplementedError(

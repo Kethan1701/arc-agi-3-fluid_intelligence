@@ -2,120 +2,94 @@
 """
 bundle_for_kaggle.py
 =====================
-Packages this repo's code (NOT model weights) into a submission-ready
-zip, mirroring the layout the Kaggle notebook/harness expects when it
-imports `agent.my_agent`.
+Builds `hybrid_lib` into a wheel for upload as a private Kaggle Dataset.
 
-What gets bundled:
-    agent/, env/, configs/  -- pure code + small config files.
+Why a wheel and not a code zip: verified against the official
+`arcprize/ARC-AGI-3-Kaggle-Starter` repo's `scripts/build_notebook.py` --
+the Kaggle submission notebook is built by splicing ONLY the raw text of
+`agent/my_agent.py` into a notebook cell. Sibling files (this repo's
+`hybrid_lib/` package) are never copied along. So `hybrid_lib` has to
+reach the Kaggle notebook the same way the `arc-agi` package itself
+does: as a wheel, installed offline in the notebook's install cell via
+`pip install --no-index --find-links`.
 
-What does NOT get bundled, on purpose:
-    models/  -- model weights belong in a separate Kaggle Dataset
-    attached to your submission notebook, not inside a code zip. Kaggle
-    Datasets handle multi-GB files properly (versioning, mounting at
-    /kaggle/input/<slug>/ read-only); a code-submission zip does not.
-    This script will refuse to bundle anything under models/ and will
-    print a reminder of the two-part submission shape:
-        1. Code (this zip, or the notebook that imports it)
-        2. Model weights (a Kaggle Dataset you create separately, see
-           README.md "Uploading model weights" section)
+This script does NOT touch `agent/my_agent.py` at all -- that file is
+meant to be copied directly into your official ARC-AGI-3-Kaggle-Starter
+clone (see README.md "Two-repo workflow"), where the starter's own
+`scripts/build_notebook.py` handles splicing it into the notebook.
 
 Usage:
-    python scripts/bundle_for_kaggle.py [--out-dir kaggle_submission] [--config configs/default.yaml]
+    python scripts/bundle_for_kaggle.py [--out-dir dist]
+
+Then, one-time per model-code change:
+    1. Upload dist/*.whl as a new version of a private Kaggle Dataset
+       (Kaggle web UI, or `kaggle datasets version -p dist/`).
+    2. In your Kaggle-Starter clone's notebook install cell, add:
+         !pip install --no-index --find-links \\
+             /kaggle/input/<your-hybrid-lib-dataset>/ hybrid-lib
+       alongside the existing `arc-agi` install line.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import json
 import shutil
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CODE_DIRS = ["agent", "env", "configs"]
 
 
-def get_git_commit() -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return None
-
-
-def build_manifest(config_path: str) -> dict:
-    return {
-        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "git_commit": get_git_commit(),
-        "config_used": config_path,
-        "bundled_dirs": CODE_DIRS,
-        "note": (
-            "Model weights are NOT included in this zip. Upload them as a "
-            "separate private Kaggle Dataset and set agent.model_dir to "
-            "the mounted /kaggle/input/... path. See README.md."
-        ),
-    }
-
-
-def stage_and_zip(out_dir: Path, config_path: str) -> Path:
+def build_wheel(out_dir: Path) -> list[Path]:
     if out_dir.exists():
         shutil.rmtree(out_dir)
-    staging = out_dir / "staging"
-    staging.mkdir(parents=True)
 
-    for rel_dir in CODE_DIRS:
-        src = REPO_ROOT / rel_dir
-        if not src.exists():
-            print(f"WARNING: expected directory {src} not found, skipping.", file=sys.stderr)
-            continue
-        dst = staging / rel_dir
-        shutil.copytree(
-            src,
-            dst,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
+    result = subprocess.run(
+        ["uv", "build", "--out-dir", str(out_dir)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stdout)
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit(
+            "uv build failed -- is `uv` installed and on PATH? "
+            "(pip users: `pip install build && python -m build --wheel "
+            f"--outdir {out_dir}` is an equivalent fallback.)"
         )
 
-    manifest = build_manifest(config_path)
-    (staging / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
-
-    zip_path = out_dir / "arc_agi3_submission.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in staging.rglob("*"):
-            if path.is_file():
-                zf.write(path, path.relative_to(staging))
-
-    return zip_path
+    wheels = sorted(out_dir.glob("*.whl"))
+    if not wheels:
+        raise SystemExit(f"uv build reported success but no .whl found in {out_dir}")
+    return wheels
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out-dir", default="kaggle_submission", help="staging/output directory")
-    parser.add_argument("--config", default="configs/default.yaml", help="config file to record in the manifest")
+    parser.add_argument("--out-dir", default="dist", help="wheel output directory")
     args = parser.parse_args()
 
     out_dir = REPO_ROOT / args.out_dir
-    zip_path = stage_and_zip(out_dir, args.config)
+    wheels = build_wheel(out_dir)
 
-    print(f"Bundled: {', '.join(CODE_DIRS)}")
-    print(f"Wrote:   {zip_path}")
+    print("Built:")
+    for wheel in wheels:
+        print(f"  {wheel}")
     print(
-        "\nReminder: model weights are NOT in this zip.\n"
-        "  1. Pre-download your model locally while you have internet.\n"
-        "  2. Upload it as a private Kaggle Dataset.\n"
-        "  3. Attach that dataset to your submission notebook and point\n"
-        "     AgentConfig.model_dir at its /kaggle/input/... path.\n"
+        "\nNext steps:\n"
+        "  1. Upload the .whl above as a private Kaggle Dataset\n"
+        "     (or a new version of an existing one).\n"
+        "  2. In your ARC-AGI-3-Kaggle-Starter clone's notebook install cell,\n"
+        "     add an offline install of it alongside the arc-agi wheel:\n"
+        "       !pip install --no-index --find-links \\\n"
+        "           /kaggle/input/<your-hybrid-lib-dataset>/ hybrid-lib\n"
+        "  3. Copy agent/my_agent.py from THIS repo into that clone's\n"
+        "     agent/my_agent.py, then `make submit` from there.\n"
+        "\n"
+        "Model weights are a SEPARATE Kaggle Dataset, not part of this\n"
+        "wheel -- see README.md 'Uploading model weights'.\n"
     )
 
 

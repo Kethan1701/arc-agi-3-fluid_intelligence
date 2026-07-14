@@ -1,207 +1,147 @@
-"""
-my_agent.py
-===========
-Main ARC-AGI-3 agent: wires together the offline model policy
-(model_runtime.py), episodic state/memory (state.py), the deterministic
-fallback solver (fallback_solver.py), and the resource manager
-(resource_manager.py) into a single decision loop.
+"""Your ARC-AGI-3 agent. This is the *only* file that gets shipped to Kaggle.
 
-Routing logic per step (the "hybrid" in "hybrid fallback system"):
-    1. If the resource manager says we're out of time budget -> fallback.
-    2. If GameMemory detects we're stuck in a loop -> fallback (break it).
-    3. Otherwise, ask the primary policy (VLLMPolicy / StubPolicy).
-       If its self-reported confidence < CONFIG.confidence_threshold,
-       or it returned an illegal/unparseable action -> fallback.
-    4. Record the transition in memory either way, so both the LLM
-       policy's future prompts and the fallback solver's heuristics
-       benefit from what was learned this step.
-
-This file intentionally has NO import-time dependency on vLLM/torch
-actually being installed -- `build_policy()` decides which backend to
-construct based on config, so you can run the exact same `ArcAgent` class
-locally (StubPolicy, no GPU) and on Kaggle (VLLMPolicy, real GPU).
+CONTRACT (verified against the official `arcprize/ARC-AGI-3-Kaggle-Starter`
+and `arcprize/ARC-AGI-3-Agents` repos -- MIT licensed, cloned and inspected
+directly rather than guessed at):
+    * When you build your actual submission, this file's raw text gets
+      spliced verbatim into the Kaggle notebook by the official starter
+      kit's `scripts/build_notebook.py` -- sibling files in THIS repo
+      (hybrid_lib/*) are NOT carried along automatically. `hybrid_lib`
+      must be installed as a wheel (offline, from a Kaggle Dataset) in
+      the notebook's install cell, the same way the starter kit already
+      installs the `arc-agi` package itself. See README.md "Two-repo
+      workflow" for the exact steps -- this file assumes `hybrid_lib` is
+      already importable.
+    * Must subclass `agents.agent.Agent` (from the vendored
+      ARC-AGI-3-Agents framework, MIT licensed).
+    * Class must be named `MyAgent`.
+    * Must implement `is_done(frames, latest_frame) -> bool` and
+      `choose_action(frames, latest_frame) -> GameAction`.
+    * `frames`/`latest_frame` are `arcengine.FrameData` -- note `.frame`
+      is `list[list[list[int]]]`, i.e. a *list of 2D grids* per frame,
+      not a single grid. `frames` is the SAME growing list as
+      `Agent.frames`, and `latest_frame is frames[-1]` -- so on each
+      call, `frames[-2]` (if it exists) is the frame from BEFORE the
+      previous action, and `frames[-1]` is the frame that action
+      produced. We use that to record the previous step's transition
+      before deciding the next one.
+    * `GameAction` is an Enum: RESET, ACTION1..ACTION5, ACTION7 are
+      "simple" (no payload); ACTION6 is "complex" and needs
+      `.set_data({"x": int, "y": int})` with x, y in [0, 63].
+    * CONCURRENCY: verified in `agents/swarm.py` -- the framework
+      instantiates one `MyAgent` PER GAME and runs all of them
+      concurrently in separate threads within one process. So
+      `__init__`/`choose_action` for *different games* can run in
+      parallel. All shared state (the model, resource budget, session
+      stats) lives in one process-wide `HybridDecisionCore` singleton
+      (`hybrid_lib.decision_core.get_shared_core`), which is
+      thread-safe; only this file's per-instance attributes are per-game.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from typing import Any
 
-from agent.fallback_solver import FallbackSolver
-from agent.model_runtime import Policy, PolicyOutput, StubPolicy
-from agent.resource_manager import ResourceManager
-from agent.state import GameMemory, SessionMemory
-from env.env_adapter import ArcEnv, RawObservation
+from arcengine import FrameData, GameAction, GameState
 
-logger = logging.getLogger("arc_agent")
+from agents.agent import Agent
 
+from hybrid_lib.decision_core import AgentConfig, get_shared_core
+from hybrid_lib.state import MultiGrid
 
-@dataclass
-class AgentConfig:
-    model_dir: str | None = None          # local path; None => use StubPolicy (no GPU)
-    confidence_threshold: float = 0.55     # below this, route to fallback solver
-    max_steps_per_game: int = 200
-    use_vllm: bool = False                 # explicit opt-in, see build_policy()
-
-
-def build_policy(config: AgentConfig) -> Policy:
-    """
-    Construct the primary policy backend. Kept as a free function (rather
-    than inline in `ArcAgent.__init__`) so tests / local runs can swap in
-    a fake Policy without touching ArcAgent itself.
-    """
-    if not config.use_vllm or not config.model_dir:
-        logger.info("Using StubPolicy (no GPU model loaded) - set config.use_vllm=True and "
-                     "config.model_dir=<local path> to enable real inference.")
-        return StubPolicy()
-
-    # Imported lazily via model_runtime; will raise a clear error locally
-    # (e.g. on Windows without vLLM) rather than at module import time.
-    from agent.model_runtime import VLLMPolicy  # noqa: PLC0415
-
-    return VLLMPolicy(model_dir=config.model_dir)
-
-
-class ArcAgent:
-    """
-    One instance is created for the whole submission process and reused
-    across every game the harness presents (see `agent_entrypoint` at the
-    bottom of this file for the Kaggle-facing hook). Keeping one instance
-    means the model weights are loaded exactly once, and the
-    `ResourceManager`'s 9-hour clock starts at construction, matching the
-    real runtime constraint.
-    """
-
-    def __init__(self, config: AgentConfig | None = None) -> None:
-        self.config = config or AgentConfig()
-        self.policy: Policy = build_policy(self.config)
-        self.fallback = FallbackSolver()
-        self.resources = ResourceManager()
-        self.session_memory = SessionMemory()
-        self._memory: GameMemory | None = None
-
-    # ------------------------------------------------------------------
-    # Per-game lifecycle
-    # ------------------------------------------------------------------
-    def start_game(self, game_id: str) -> None:
-        self._memory = GameMemory(game_id=game_id)
-        self.resources.start_game(game_id)
-        logger.info("Starting game %s | budget=%s", game_id, self.resources.summary())
-
-    def end_game(self, solved: bool) -> None:
-        assert self._memory is not None
-        self.session_memory.ingest(self._memory, solved=solved)
-        self.resources.end_game()  # VRAM cleanup + reset per-game timer
-        logger.info(
-            "Ended game %s solved=%s steps=%d | session_solve_rate=%.2f",
-            self._memory.game_id,
-            solved,
-            self._memory.step_index,
-            self.session_memory.solve_rate,
-        )
-        self._memory = None
-
-    # ------------------------------------------------------------------
-    # Core decision step
-    # ------------------------------------------------------------------
-    def act(self, observation: RawObservation) -> tuple[str, dict | None]:
-        """
-        Choose the next action given the current observation. Returns
-        (action, action_args). This is the function you call once per
-        environment step; the resulting (action, next_observation) pair
-        should be fed back via `record_transition` below.
-        """
-        assert self._memory is not None, "call start_game() first"
-        memory = self._memory
-        step_index = memory.step_index
-
-        with self.resources.timed_step(memory.game_id, step_index) as timing:
-            decision_source, action, action_args = self._decide(observation, memory)
-            timing.used_fallback = decision_source == "fallback"
-
-        logger.debug("step=%d source=%s action=%s", step_index, decision_source, action)
-        return action, action_args
-
-    def _decide(
-        self, observation: RawObservation, memory: GameMemory
-    ) -> tuple[str, str, dict | None]:
-        # 1) Hard resource ceiling reached -> always fallback, regardless
-        #    of what the primary policy would have said.
-        if self.resources.should_use_fallback_only() or self.resources.game_time_exhausted():
-            decision = self.fallback.decide(observation, memory)
-            return "fallback", decision.action, decision.action_args
-
-        # 2) Detected a stuck loop -> break it deterministically rather
-        #    than trusting the model to notice its own repetition.
-        if memory.is_looping():
-            decision = self.fallback.decide(observation, memory)
-            return "fallback", decision.action, decision.action_args
-
-        # 3) Ask the primary policy; fall back on low confidence.
-        prompt = memory.summarize_for_prompt()
-        policy_output: PolicyOutput = self.policy.act(prompt, observation.action_space)
-        if policy_output.confidence < self.config.confidence_threshold:
-            decision = self.fallback.decide(observation, memory)
-            return "fallback", decision.action, decision.action_args
-
-        return "policy", policy_output.action, policy_output.action_args
-
-    def record_transition(
-        self,
-        frame_before,
-        action: str,
-        action_args: dict | None,
-        obs_after: RawObservation,
-    ) -> None:
-        assert self._memory is not None
-        self._memory.record(frame_before, action, action_args, obs_after)
-
-    # ------------------------------------------------------------------
-    # Convenience: drive a full local ArcEnv-compatible env end-to-end.
-    # Handy for local_mock_env.py testing; NOT used by the Kaggle harness
-    # path, which instead calls `act`/`record_transition` step-by-step
-    # under harness control (see agent_entrypoint below).
-    # ------------------------------------------------------------------
-    def play_game(self, env: ArcEnv, game_id: str) -> bool:
-        observation = env.reset(game_id)
-        self.start_game(game_id)
-        solved = False
-        for _ in range(self.config.max_steps_per_game):
-            frame_before = observation.frame
-            action, action_args = self.act(observation)
-            observation = env.step(action, action_args)
-            self.record_transition(frame_before, action, action_args, observation)
-            if observation.done:
-                solved = observation.level_complete
-                break
-        self.end_game(solved)
-        return solved
-
-    def shutdown(self) -> None:
-        self.policy.shutdown()
-
+logger = logging.getLogger()
 
 # ----------------------------------------------------------------------
-# Kaggle-facing entrypoint.
-#
-# NOTE: the exact calling convention the grader uses (module-level
-# function vs. class instantiation, argument names/types) is defined by
-# the official ARC-AGI-3 starter kit -- confirm this against the real
-# starter notebook before your first submission and adjust the signature
-# below accordingly. A single module-level `AGENT` singleton is used here
-# so model weights load once per process rather than once per game.
+# EDIT ME before submitting: point at your offline model dataset and flip
+# use_vllm on. Leave use_vllm=False (the default) to submit a GPU-free
+# baseline that always uses the deterministic FallbackSolver -- a good
+# first submission to prove the end-to-end pipeline works before betting
+# on a model.
 # ----------------------------------------------------------------------
-AGENT: ArcAgent | None = None
+CONFIG = AgentConfig(
+    model_dir=None,          # e.g. "/kaggle/input/your-model-dataset/model"
+    use_vllm=False,
+    confidence_threshold=0.55,
+)
+
+# arcengine.GameAction.ACTION6 is the only action needing (x, y) payload
+# data as of the arcengine version this was verified against (0.9.3) --
+# re-check `GameAction.all_complex()` if you're on a newer arc-agi release.
+_COMPLEX_ACTION_NAMES = frozenset(a.name for a in GameAction.all_complex())
 
 
-def get_agent() -> ArcAgent:
-    global AGENT
-    if AGENT is None:
-        AGENT = ArcAgent(
-            AgentConfig(
-                model_dir="/kaggle/input/your-model-dataset/model",  # EDIT ME
-                use_vllm=True,
-                confidence_threshold=0.55,
+def _to_multigrid(frame: FrameData) -> MultiGrid:
+    return frame.frame
+
+
+class MyAgent(Agent):
+    """Hybrid LLM + deterministic-fallback agent. See module docstring."""
+
+    MAX_ACTIONS = CONFIG.max_steps_per_game
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # self.game_id is set by Agent.__init__ above. get_shared_core()
+        # is a process-wide singleton -- see this module's docstring on
+        # concurrency. Only the first call across all game threads
+        # actually constructs it (and loads the model, if enabled).
+        self._core = get_shared_core(CONFIG)
+        self._core.start_game(self.game_id)
+        self._last_action: tuple[str, dict | None] | None = None
+
+    def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
+        # Stop once we win. Don't stop on GAME_OVER -- RESET and retry
+        # (matches the official sample's behavior). Also stop early if
+        # this game's own wall-clock budget is exhausted, so a stuck game
+        # doesn't sit occupying a thread/GPU slot for the rest of the run.
+        if latest_frame.state is GameState.WIN:
+            self._core.end_game(self.game_id, solved=True)
+            return True
+        if self._core.resources.game_time_exhausted(self.game_id):
+            logger.info("game=%s stopping: per-game time budget exhausted", self.game_id)
+            self._core.end_game(self.game_id, solved=False)
+            return True
+        return False
+
+    def choose_action(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
+        # Record the outcome of the PREVIOUS action, now visible as the
+        # (frames[-2] -> frames[-1]) transition, before deciding the next
+        # one. On the very first call frames has only the framework's
+        # initial placeholder entry, so there's nothing to record yet.
+        if self._last_action is not None and len(frames) >= 2:
+            action_name, action_args = self._last_action
+            self._core.record(
+                self.game_id,
+                _to_multigrid(frames[-2]),
+                action_name,
+                action_args,
+                _to_multigrid(latest_frame),
+                game_state_after=latest_frame.state.value,
+                levels_completed_after=latest_frame.levels_completed,
             )
-        )
-    return AGENT
+        self._last_action = None
+
+        # First call or after a death -> reset the level (matches the
+        # official sample's baseline behavior).
+        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+            action = GameAction.RESET
+            action.reasoning = {"why": "reset on NOT_PLAYED/GAME_OVER"}
+            self._last_action = (action.name, None)
+            return action
+
+        action_space = [GameAction.from_id(i).name for i in latest_frame.available_actions] or [
+            GameAction.RESET.name
+        ]
+
+        decision = self._core.choose(self.game_id, action_space, _COMPLEX_ACTION_NAMES)
+
+        action = GameAction.from_name(decision.action)
+        if action.is_complex():
+            action.set_data(decision.action_args or {"x": 32, "y": 32})
+        action.reasoning = {"source": decision.reasoning}
+
+        self._last_action = (decision.action, decision.action_args)
+        return action

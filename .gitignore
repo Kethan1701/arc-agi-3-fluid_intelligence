@@ -7,17 +7,13 @@ __pycache__/
 build/
 dist/
 
-# Virtual environments (NOTE: does not match the env/ package dir, only
-# a literal .venv/venv folder at the repo root)
+# Virtual environments
 .venv/
 venv/
 
 # Model weights -- large binaries, never commit; keep the placeholder
 models/*
 !models/.gitkeep
-
-# Packaging output
-kaggle_submission/
 
 # Editor / OS
 .vscode/

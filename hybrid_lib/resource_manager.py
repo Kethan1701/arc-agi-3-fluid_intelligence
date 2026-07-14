@@ -1,29 +1,43 @@
 """
 resource_manager.py
 ====================
-Wall-clock and VRAM safeguards for the 9-hour Kaggle runtime limit.
+Wall-clock safeguards for the 9-hour Kaggle runtime limit.
 
-Two independent concerns live here:
-    1. Global time budget -- track elapsed time against the 9h ceiling
-       (with a safety margin), and expose `should_use_fallback_only()`
-       so the agent can pre-emptively stop calling the (slow, GPU-bound)
-       LLM policy well before the hard cutoff, finishing remaining games
-       with the cheap deterministic solver instead of risking a
-       kill mid-inference (which likely scores worse than a fast, if
-       weaker, submitted action).
-    2. Per-task/per-step VRAM hygiene -- explicit `torch.cuda.empty_cache()`
-       + `gc.collect()` between games, plus a per-step inference timeout
-       so a single pathological step can't silently eat the whole budget.
+IMPORTANT -- concurrency model (verified against `agents/swarm.py` in the
+official ARC-AGI-3-Agents framework): the framework's `Swarm.main()`
+instantiates one `Agent` subclass PER GAME and runs ALL of them
+*concurrently*, each in its own `Thread`, sharing one process. With up to
+~110 games in a run, that means many `MyAgent.choose_action()` calls can
+be in flight at once, from different threads, against whatever shared
+model/resources this class holds.
 
-Kept dependency-light: torch is imported lazily and all torch-specific
-calls are wrapped so this module works fine even if torch isn't
-installed/available (e.g. a CPU-only smoke test box).
+Two consequences that shaped this design (and differ from a naive
+"one game at a time" resource manager):
+    1. Per-game timing state must be keyed by `game_id` in a dict, not
+       stored as a single shared attribute -- multiple games are "in
+       progress" simultaneously.
+    2. There is NO safe point to call `torch.cuda.empty_cache()` /
+       reload the model "between games", because there usually isn't a
+       moment when *no* game is using the shared model -- other threads
+       may have in-flight vLLM requests at any time. VRAM cleanup here is
+       therefore a single explicit `shutdown()` call for process-exit
+       only (see `hybrid_lib.decision_core.HybridDecisionCore`), not a
+       per-game hook. Games sharing a single vLLM engine instance is
+       actually the *correct* design for throughput (vLLM's continuous
+       batching is built for concurrent requests) -- just don't tear
+       anything down mid-run.
+
+All public mutation methods are guarded by a single `threading.Lock`
+for correctness under this concurrent-games model. This trades a little
+throughput (lock contention is brief -- just bookkeeping, not the actual
+model call) for avoiding races on shared counters/dicts.
 """
 
 from __future__ import annotations
 
 import contextlib
 import gc
+import threading
 import time
 from dataclasses import dataclass
 
@@ -67,16 +81,19 @@ class StepTiming:
 
 class ResourceManager:
     """
-    Instantiate once per submission process (i.e. once for the whole
-    9-hour run) and share it across every game the agent plays.
+    Instantiate once per submission process (i.e. once for the whole 9h
+    run) and share it across every concurrently-running game's agent.
+    Thread-safe: see module docstring.
     """
 
     def __init__(self, budget: ResourceBudget | None = None) -> None:
         self.budget = budget or ResourceBudget()
         self._start_time = time.monotonic()
-        self._game_start_time: float | None = None
+        self._lock = threading.Lock()
+        self._game_start_times: dict[str, float] = {}
         self.step_log: list[StepTiming] = []
         self._forced_fallback_only = False
+        self._force_reason: str | None = None
 
     # ------------------------------------------------------------------
     # Time budget
@@ -102,26 +119,34 @@ class ResourceManager:
         return self.remaining_seconds <= self.budget.safety_margin_seconds
 
     def force_fallback_only(self, reason: str) -> None:
-        self._forced_fallback_only = True
-        self._last_force_reason = reason
+        with self._lock:
+            self._forced_fallback_only = True
+            self._force_reason = reason
 
-    def game_time_exhausted(self) -> bool:
-        if self._game_start_time is None:
+    def game_time_exhausted(self, game_id: str) -> bool:
+        with self._lock:
+            start = self._game_start_times.get(game_id)
+        if start is None:
             return False
-        return (time.monotonic() - self._game_start_time) >= self.budget.max_seconds_per_game
+        return (time.monotonic() - start) >= self.budget.max_seconds_per_game
 
     # ------------------------------------------------------------------
     # Per-game / per-step lifecycle hooks
     # ------------------------------------------------------------------
     def start_game(self, game_id: str) -> None:
-        self._game_id = game_id
-        self._game_start_time = time.monotonic()
+        with self._lock:
+            self._game_start_times[game_id] = time.monotonic()
 
-    def end_game(self) -> None:
-        """Call between games to release GPU memory and reset counters."""
-        gc.collect()
-        _torch_cuda_cleanup()
-        self._game_start_time = None
+    def end_game(self, game_id: str) -> None:
+        """
+        Call when one game finishes. Only clears that game's own timing
+        entry -- does NOT touch GPU memory, since other games' threads
+        may still be mid-inference against the same shared model. See
+        module docstring / `HybridDecisionCore.shutdown()` for the actual
+        (process-exit-only) VRAM cleanup path.
+        """
+        with self._lock:
+            self._game_start_times.pop(game_id, None)
 
     @contextlib.contextmanager
     def timed_step(self, game_id: str, step_index: int):
@@ -131,13 +156,13 @@ class ResourceManager:
                 ... call the policy / fallback solver ...
                 timing.used_fallback = <bool>
 
-        Records duration regardless of success/failure, and raises
-        `StepTimeoutExceeded` after the fact if the step ran over budget
-        so the caller can decide to force fallback mode for subsequent
-        steps (it cannot preemptively kill a running vLLM generate() call
-        -- that requires vLLM-level request cancellation/timeouts, which
-        you should also configure via SamplingParams / server timeouts
-        for defense in depth).
+        Records duration regardless of success/failure. If the step ran
+        over `max_seconds_per_step`, latches `force_fallback_only()` for
+        all games for the rest of the run -- this cannot preemptively
+        kill an in-flight vLLM call (that requires vLLM-level request
+        cancellation/timeouts, configure those too for defense in depth),
+        but it stops the *next* step across every game's thread from
+        making the situation worse.
         """
         timing = StepTiming(game_id=game_id, step_index=step_index, duration_seconds=0.0, used_fallback=False)
         t0 = time.monotonic()
@@ -145,21 +170,35 @@ class ResourceManager:
             yield timing
         finally:
             timing.duration_seconds = time.monotonic() - t0
-            self.step_log.append(timing)
+            with self._lock:
+                self.step_log.append(timing)
             if timing.duration_seconds > self.budget.max_seconds_per_step:
                 self.force_fallback_only(
                     reason=f"step {step_index} of {game_id} took {timing.duration_seconds:.1f}s "
                     f"(> {self.budget.max_seconds_per_step}s budget)"
                 )
 
+    def shutdown(self) -> None:
+        """
+        Process-exit-only VRAM cleanup. Only safe to call once every
+        game thread has finished (i.e. after `Swarm.main()` returns) --
+        see module docstring for why this can't happen per-game.
+        """
+        gc.collect()
+        _torch_cuda_cleanup()
+
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
     def summary(self) -> dict:
+        with self._lock:
+            steps_recorded = len(self.step_log)
+            active_games = len(self._game_start_times)
         return {
             "elapsed_seconds": round(self.elapsed_seconds, 1),
             "remaining_seconds": round(self.remaining_seconds, 1),
             "fallback_only": self.should_use_fallback_only(),
-            "steps_recorded": len(self.step_log),
+            "steps_recorded": steps_recorded,
+            "active_games": active_games,
             "cuda_memory_mb": _torch_cuda_memory_mb(),
         }

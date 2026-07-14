@@ -1,0 +1,19 @@
+[project]
+name = "hybrid-lib"
+version = "0.1.0"
+description = "Reusable hybrid (LLM + deterministic fallback) decision core for an ARC-AGI-3 agent."
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Only ship the installable library. `agent/my_agent.py` is NOT part of
+# this package -- per the official ARC-AGI-3-Kaggle-Starter contract, it
+# must live as a standalone file inside your Kaggle-Starter clone (its
+# raw text gets spliced directly into the submission notebook). This
+# wheel is what `agent/my_agent.py` imports at runtime; see README.md
+# "Two-repo workflow" for how the pieces fit together.
+packages = ["hybrid_lib"]
