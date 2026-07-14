@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments (NOTE: does not match the env/ package dir, only
+# a literal .venv/venv folder at the repo root)
+.venv/
+venv/
+
+# Model weights -- large binaries, never commit; keep the placeholder
+models/*
+!models/.gitkeep
+
+# Packaging output
+kaggle_submission/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local logs / scratch
+*.log
+.env

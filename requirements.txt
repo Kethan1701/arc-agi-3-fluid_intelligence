@@ -1,0 +1,34 @@
+# Local development requirements.
+#
+# NOTE on vLLM + Windows: vLLM does not officially support native Windows.
+# If you're on Windows (as this scaffold assumes), do ONE of:
+#   (a) Only install the top "core" block below and develop against
+#       agent.model_runtime.StubPolicy — the full agent loop (state
+#       tracking, fallback routing, resource management) works without
+#       vLLM/torch-cuda at all.
+#   (b) Install WSL2 + a Linux Python env and install the "gpu" block
+#       there for real vLLM inference testing before submitting.
+#   (c) Test real inference directly in a Kaggle notebook, which runs
+#       Linux + NVIDIA GPUs natively.
+#
+# Kaggle's execution image already provides recent torch/CUDA; you should
+# NOT pip-install a fresh torch/vllm inside the submission notebook if the
+# competition disallows internet access during scoring — only install
+# what you need at BUILD time or pin versions matching the base image.
+
+# --- core (works on Windows/macOS/Linux, no GPU required) --------------
+numpy>=1.26,<2.0
+pyyaml>=6.0
+pydantic>=2.6
+rich>=13.7          # nice local console logging, optional
+pytest>=8.0
+
+# --- gpu / real inference (Linux + NVIDIA only — WSL2 or Kaggle) -------
+# Uncomment on a Linux box with an NVIDIA GPU + matching CUDA toolkit.
+# torch>=2.3
+# vllm>=0.5
+# transformers>=4.42
+# accelerate>=0.31
+
+# --- packaging helper ---------------------------------------------------
+huggingface_hub>=0.23   # used ONLY at local build time to pre-download model weights
