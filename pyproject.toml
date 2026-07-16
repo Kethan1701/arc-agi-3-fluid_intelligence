@@ -2,7 +2,7 @@
 name = "hybrid-lib"
 version = "0.1.0"
 description = "Reusable hybrid (LLM + deterministic fallback) decision core for an ARC-AGI-3 agent."
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = []
 
 [build-system]
