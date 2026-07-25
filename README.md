@@ -1,5 +1,36 @@
 # arc-agi-3-fluid_intelligence
 
+> ## ⚠️ The wheel/dataset workflow below is retired
+>
+> The shipped agent now lives **only** in the starter-kit clone, at
+> `ARC-AGI-3-Kaggle-Starter/agent/my_agent.py`, and is entirely
+> self-contained: standard library + `arcengine` + the framework's
+> `Agent` base class. It does **not** import `hybrid_lib`.
+>
+> **Why the change.** `hybrid_lib` could only reach Kaggle as a wheel in
+> a private Kaggle Dataset, and that plumbing caused both of the
+> submission failures on this project: first a `--find-links` pointing at
+> a `kaggle.com` URL, which cannot resolve because runtime internet is
+> disabled (Kaggle reported it only as a bare "system error"), and then a
+> follow-up fix that replaced the install cell wholesale and silently
+> dropped the `arc-agi` install. Neither failure was about the agent's
+> logic. Making the one shipped file self-contained deletes the private
+> dataset, the `dataset_sources` attach, the second `pip install`, and
+> the mount-path check — the entire failure mode — at the cost of nothing
+> the submission was actually using.
+>
+> **Why the logic changed too.** `hybrid_lib`'s solver scored 0 on every
+> game: it was capped at 80 actions per game, aimed `ACTION6` at
+> uniformly random coordinates (1 of 4096, almost always background), and
+> had no notion of level progress. The replacement maps the reachable
+> state space as a graph and routes to unexplored frontiers, and aims
+> clicks at detected objects. On the local dev games that took ls20 from
+> 0 to level 1 and vc33 from 0 to level 2.
+>
+> `hybrid_lib/` and `scripts/bundle_for_kaggle.py` are kept here as
+> reference, but nothing in the submission path reads them. Do not
+> re-introduce the private-dataset install step.
+
 `hybrid_lib`: a reusable, testable decision core (episodic memory +
 deterministic fallback solver + confidence-gated LLM routing + resource
 budget management) for a Kaggle **ARC Prize 2026 — ARC-AGI-3** agent,
