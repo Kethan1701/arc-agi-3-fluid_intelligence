@@ -62,13 +62,15 @@ resource management, offline vLLM wrapper) — has to reach Kaggle a
 different way: as a wheel, installed offline in the notebook, exactly
 the way the starter kit already installs the `arc-agi` package itself.
 
-The split:
+The split (the wheel row below is **superseded — see callout at top**;
+`agent/my_agent.py` no longer imports `hybrid_lib`, so nothing installs it
+on the Kaggle side anymore):
 
 | This repo (`arc-agi-3-fluid_intelligence`)          | Your official starter clone                          |
 |------------------------------------------------------|--------------------------------------------------------|
 | `hybrid_lib/` — the reusable decision core, unit tested | `agent/my_agent.py` — the one file Kaggle reads, copied in from here |
 | `agent/my_agent.py` — reference implementation to copy over | `make setup / play-local / submit / status` — the real local-dev and submission workflow |
-| `scripts/bundle_for_kaggle.py` — builds the `hybrid_lib` wheel | vendors `ARC-AGI-3-Agents` (MIT) and the live gateway connection for real local play |
+| `scripts/bundle_for_kaggle.py` — builds the `hybrid_lib` wheel *(superseded)* | vendors `ARC-AGI-3-Agents` (MIT) and the live gateway connection for real local play |
 
 We deliberately do **not** vendor the starter kit's Makefile/scripts
 into this repo: as of this writing it has no LICENSE file (unlike
@@ -108,7 +110,7 @@ environment).
 
 ```
 arc-agi-3-fluid_intelligence/
-├── hybrid_lib/                  # installable package -- ships to Kaggle as a wheel
+├── hybrid_lib/                  # installable package -- kept as reference only (superseded, see callout at top)
 │   ├── decision_core.py         # HybridDecisionCore: shared, thread-safe routing brain
 │   ├── model_runtime.py         # VLLMPolicy (offline vLLM, Blackwell-aware) + StubPolicy
 │   ├── state.py                 # GameMemory (per-game) / SessionMemory (per-run)
@@ -220,7 +222,10 @@ weights:
 4. Point `CONFIG.model_dir` in `agent/my_agent.py` at that mounted path,
    and set `CONFIG.use_vllm = True`.
 
-## Packaging hybrid_lib for Kaggle
+## Packaging hybrid_lib for Kaggle (superseded — see callout at top)
+
+Kept for reference only; nothing in the submission path installs this wheel
+anymore.
 
 ```powershell
 python scripts\bundle_for_kaggle.py
@@ -261,8 +266,10 @@ the script.
 1. Clone the official starter kit (see "Two-repo workflow" above) and
    run through its own README — it needs an ARC Prize API key (for
    `make play-local`) and a Kaggle API token (for `make submit`).
-2. Build and upload the `hybrid_lib` wheel (above), and edit the install
-   cell in the starter's notebook build script to install it.
+2. ~~Build and upload the `hybrid_lib` wheel (above), and edit the install
+   cell in the starter's notebook build script to install it.~~
+   **Superseded — see callout at top.** `agent/my_agent.py` is
+   self-contained now; skip this step.
 3. Stage and upload your model weights as their own Kaggle Dataset, and
    set `CONFIG.model_dir`/`CONFIG.use_vllm` in `agent/my_agent.py`.
 4. If you're targeting the RTX 6000 Pro accelerator, also bundle
